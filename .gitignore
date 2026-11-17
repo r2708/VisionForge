@@ -1,0 +1,56 @@
+# --- secrets (never commit) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- pipeline runtime data (downloads, processed output, checkpoints, state, logs) ---
+/workspace/
+/workspace*/
+/demo_workspace*/
+/processed_dataset/
+/checkpoints/
+/downloads/
+/shards/
+/logs/
+/cache/
+/data/
+/benchmarks/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+run.lock
+*.log
+*.part
+*.parquet
+*.tmp
+
+# --- input data and other local folders ---
+/Images/
+/images/
+/YT_A/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- leftovers from the removed dashboard ---
+node_modules/
+.next/

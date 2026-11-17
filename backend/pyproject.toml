@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "image-dataset-pipeline"
+version = "0.1.0"
+description = "AI image dataset curation and preparation pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "pillow>=10.0",
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "opencv-python-headless>=4.8",
+  "pydantic>=2.5",
+  "sqlalchemy>=2.0",
+  "pyyaml>=6.0",
+  "typer>=0.12",
+  "rich>=13.0",
+  "psutil>=5.9",
+  "pyarrow>=14.0",
+]
+
+[project.optional-dependencies]
+# Needed only for the model-backed stages (embeddings, zero-shot tags, alignment, VLM captions).
+ml = ["torch>=2.1", "transformers>=4.45", "huggingface_hub>=0.23"]
+ocr = ["rapidocr-onnxruntime>=1.3"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+image-pipeline = "app.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["app/tests"]
+filterwarnings = ["ignore::DeprecationWarning", "ignore::FutureWarning"]

@@ -1,0 +1,54 @@
+# Model registry. Nothing listed here is downloaded automatically.
+# Sizes and memory figures are approximate; always confirm the licence on the model card
+# before using a model for your purpose. A workspace copy at configs/model_registry.yaml
+# overrides this file.
+models:
+  clip-vit-base-patch32:
+    task: [embedding, zero_shot, alignment]
+    adapter: clip
+    repo: openai/clip-vit-base-patch32
+    download_size_gb: 0.6
+    ram_gb: 1.5
+    vram_gb: 1.0
+    license: "MIT (per the OpenAI CLIP repository) - verify on the model card"
+    notes: "512-d image/text embeddings. Text input is truncated to 77 tokens. Used for semantic similarity, zero-shot tags, the aesthetic ranking signal and image-text alignment."
+
+  clip-vit-large-patch14:
+    task: [embedding, zero_shot, alignment]
+    adapter: clip
+    repo: openai/clip-vit-large-patch14
+    download_size_gb: 1.7
+    ram_gb: 3.0
+    vram_gb: 2.5
+    license: "MIT (per the OpenAI CLIP repository) - verify on the model card"
+    notes: "768-d embeddings; stronger but slower than ViT-B/32. Not benchmarked in this project yet."
+
+  smolvlm2-256m:
+    task: [captioning]
+    adapter: smolvlm
+    repo: HuggingFaceTB/SmolVLM2-256M-Video-Instruct
+    download_size_gb: 1.0
+    ram_gb: 2.5
+    vram_gb: 2.0
+    license: "Apache-2.0 - verify on the model card"
+    notes: "Very small VLM. Fits 8 GB machines; captions are short and can miss or invent detail, so verification and review stay important."
+
+  smolvlm2-2.2b:
+    task: [captioning]
+    adapter: smolvlm
+    repo: HuggingFaceTB/SmolVLM2-2.2B-Instruct
+    download_size_gb: 4.5
+    ram_gb: 8.0
+    vram_gb: 6.0
+    license: "Apache-2.0 - verify on the model card"
+    notes: "Larger sibling using the same adapter. Not benchmarked in this project yet; needs more memory than an 8 GB machine comfortably offers."
+
+  owlv2-base:
+    task: [object_detection]
+    adapter: hf_zero_shot_detector
+    repo: google/owlv2-base-patch16-ensemble
+    download_size_gb: 0.7
+    ram_gb: 3.0
+    vram_gb: 3.0
+    license: "Apache-2.0 - verify on the model card"
+    notes: "Open-vocabulary detector driven by a label list. The adapter is implemented but has not been exercised in this project's tests (weights are not present locally)."

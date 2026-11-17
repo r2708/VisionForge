@@ -1,0 +1,149 @@
+# Image dataset pipeline configuration (all values shown are the defaults unless noted).
+# Copy to <workspace>/configs/pipeline_config.yaml. Unknown keys and non-numeric thresholds are rejected.
+
+project:
+  name: image-dataset-project
+  mode: text_to_image            # text_to_image | vision_language | general_multimodal
+  pipeline_version: "0.1.0"
+
+paths:
+  # Read-only image folders. A plain path string also works.
+  sources: []
+  # sources:
+  #   - path: /path/to/images
+  #     label: my-collection          # stable name; image IDs derive from it
+  #     license: CC-BY-4.0
+  #     rights_status: user_attested  # verified | user_attested | unknown | restricted | not_for_training
+  #     creator: Jane Doe
+  #     source_url: https://example.org/collection
+  #     metadata_file: metadata.csv   # optional per-image rights/captions (csv, json or jsonl)
+  output_dir: ./processed_dataset   # relative paths are resolved against the workspace
+  checkpoints_dir: ./checkpoints
+  logs_dir: ./logs
+  cache_dir: ./cache
+
+processing:
+  recursive_scan: true
+  preserve_originals: true        # must stay true
+  resume_enabled: true
+  follow_symlinks: false
+  max_retries: 2                  # extra attempts per image and stage (0-10)
+  cpu_workers: 4                  # 1-64
+  gpu_batch_size: auto            # auto or 1-512
+  device: auto                    # auto | cpu | mps | cuda
+  allow_cpu_fallback: true
+  db_chunk_size: 200              # images per checkpointed chunk
+
+stages:                           # true | false | auto (auto = on when relevant to the mode and available)
+  perceptual_hash: auto
+  technical_quality: auto
+  people: auto
+  ocr: false                      # optional; needs the 'ocr' extra
+  segmentation: false             # optional
+  embeddings: auto
+  zero_shot: auto
+  object_detection: false         # optional; needs a detector from the model registry
+  captioning: auto
+  alignment: auto
+
+images:
+  output_format: auto             # auto | jpeg | png | webp
+  jpeg_quality: 95                # 50-100
+  webp_quality: 95
+  preserve_aspect_ratio: true     # must stay true
+  auto_upscale: false             # must stay false (not implemented)
+  preserve_alpha: true
+  alpha_background: [255, 255, 255]
+  convert_to_srgb: true
+  copy_unchanged_when_possible: true
+  strip_location_metadata: true
+  max_side: null                  # optional downscale limit in pixels
+  resolution_buckets: [512, 768, 1024]
+  bucket_step: 64
+
+quality:
+  min_width: 512                  # pixels
+  min_height: 512
+  min_overall_score: 65           # 0-100
+  min_aesthetic_score: null       # 0-100 or null
+  manual_review_band: [55, 75]    # overall scores in this range go to review
+  weights: {sharpness: 0.25, noise: 0.10, compression: 0.10, exposure: 0.15, contrast: 0.10, resolution: 0.10, composition: 0.05, aesthetic: 0.15}
+  reject_watermarked: false
+  max_text_area_fraction: null    # 0-1 or null
+
+deduplication:
+  exact: true
+  perceptual: true
+  near: true
+  semantic: true
+  auto_delete: false              # must stay false
+  perceptual_threshold: 6         # max pHash Hamming distance (0-32 of 64 bits)
+  near_candidate_hamming: 24
+  near_candidate_cosine: 0.80
+  near_max_candidates_per_image: 8
+  near_min_inliers: 25
+  near_min_inlier_ratio: 0.25
+  semantic_threshold: 0.93        # min embedding cosine (0-1)
+  non_representative_action: quarantine   # quarantine | flag
+  max_per_semantic_group: null
+
+captioning:
+  adapter: template               # none | template | sidecar | smolvlm
+  short_caption: true
+  detailed_caption: true
+  comprehensive_caption: true
+  generation_prompt: true
+  alternate_caption_count: 0      # 0-5
+  verify_captions: true
+  strictness: standard            # lenient | standard | strict
+  max_new_tokens: 160
+  sidecar_extension: .txt
+  training_caption_field: detailed   # short | detailed | comprehensive | generation_prompt
+  review_template_captions: true
+
+models:
+  embedding: clip-vit-base-patch32   # key from configs/model_registry.yaml, or none
+  captioner: smolvlm2-256m
+  ocr: rapidocr                      # none | rapidocr
+  segmentation: grabcut_saliency     # none | grabcut_saliency
+  object_detector: none
+  detection_labels: []
+
+rights:
+  require_approved_status_for_export: true
+  allowed_statuses: [verified, user_attested]
+  default_status: unknown
+
+splits:
+  train: 0.90
+  validation: 0.05
+  test: 0.05
+  seed: 42
+  group_near_duplicates: true
+  group_semantic: false
+  group_by_source_directory: false
+
+curation:
+  max_per_category: null
+  exclude_categories: []
+
+export:
+  formats: [jsonl, csv]              # jsonl | csv | parquet
+  include_processed_images: true     # must stay true
+  remote_upload_enabled: false       # legacy switch, must stay false; use the huggingface section
+  minimal_manifest: hf_imagefolder   # hf_imagefolder | caption_txt | both | none
+  vlm_qa: false
+
+huggingface:                         # optional upload after a successful export; off by default
+  enabled: false
+  repo_id: null                      # username/dataset-name (created if it does not exist)
+  private: false                     # false = PUBLIC repository
+  min_size_mb: 1024                  # upload only once processed_dataset/ is at least this big
+  require_validation_passed: true
+  commit_message: Update dataset
+  # The token is never stored here: run `hf auth login` once, or set the HF_TOKEN environment variable.
+
+storage:
+  min_free_disk_gb: 2.0
+  max_output_gb: null
+  thumbnail_size: 384
