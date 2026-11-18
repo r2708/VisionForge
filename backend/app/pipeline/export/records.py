@@ -41,9 +41,8 @@ def visual_annotations(img: Image, results: dict[str, StageResult]) -> dict:
     qa = _data(results, "quality")
     comp = (q or {}).get("composition", {})
     edits = (img.user_edits or {}).get("tags")
-    watermark = None
-    if zs or ocr:
-        watermark = bool((zs or {}).get("watermark", {}).get("likely")) or "watermark_text_detected" in (qa or {}).get("flags", [])
+    # Decided from text read in the image; None when no text was read (the CLIP guess alone is not reliable).
+    watermark = "watermark_text_detected" in (qa or {}).get("flags", []) if ocr else None
     return {
         "categories": _labels(zs, "categories"),
         "objects": (det or {}).get("objects", []),

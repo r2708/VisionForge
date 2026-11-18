@@ -140,10 +140,14 @@ class SmolVLMAdapter:
         return {"name": self.spec.key, "repo": self.spec.repo, "revision": self.revision, "precision": "float32",
                 "quantization": None, "library": "transformers", "decoding": "greedy"}
 
-    def ask(self, image, prompt: str, max_new_tokens: int = 160) -> str:
+    def ask(self, image, prompt: str, max_new_tokens: int = 160, split_image: Optional[bool] = None) -> str:
+        """``split_image=False`` shows the model the image once instead of as a grid of tiles: about a
+        tenth of the input tokens. On an 8 GB Apple M2 that was 3-5 s per image instead of 23-220 s,
+        with captions of the same quality on the images compared."""
         messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        extra = {} if split_image is None else {"do_image_splitting": split_image}
         inputs = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True,
-                                                    return_dict=True, return_tensors="pt").to(self.device)
+                                                    return_dict=True, return_tensors="pt", **extra).to(self.device)
         with self.torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, repetition_penalty=1.1)
         text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
@@ -151,30 +155,39 @@ class SmolVLMAdapter:
 
 
 class ZeroShotDetectorAdapter:
-    """Open-vocabulary object detector through the transformers zero-shot-object-detection pipeline."""
+    """Open-vocabulary object detector (OWLv2 family through transformers)."""
 
     def __init__(self, spec: ModelSpec, device: str, revision: str, local_only: bool):
-        from transformers import pipeline
+        import torch
+        from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
         _quiet()
-        self.spec, self.revision = spec, revision
+        self.spec, self.device, self.revision, self.torch = spec, device, revision, torch
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.pipe = pipeline("zero-shot-object-detection", model=spec.repo, device=device,
-                                 model_kwargs={"local_files_only": local_only})
+            self.processor = AutoProcessor.from_pretrained(spec.repo, local_files_only=local_only)
+            self.model = AutoModelForZeroShotObjectDetection.from_pretrained(spec.repo, local_files_only=local_only).to(device).eval()
 
     def info(self) -> dict:
         return {"name": self.spec.key, "repo": self.spec.repo, "revision": self.revision, "precision": "float32", "library": "transformers"}
 
     def detect(self, image, labels: list[str], threshold: float = 0.25) -> list[dict]:
         w, h = image.size
+        side = max(w, h)  # the processor pads the image to a square, and boxes come back in that square's coordinates
+        inputs = self.processor(text=[[f"a photo of a {x}" for x in labels]], images=image, return_tensors="pt").to(self.device)
+        with self.torch.no_grad():
+            outputs = self.model(**inputs)
+        found = self.processor.post_process_grounded_object_detection(
+            outputs, threshold=threshold, target_sizes=self.torch.tensor([[side, side]]))[0]
         out = []
-        for d in self.pipe(image, candidate_labels=labels, threshold=threshold):
-            b = d["box"]
-            out.append({"label": d["label"], "confidence": round(float(d["score"]), 4),
-                        "bbox": [round(b["xmin"] / w, 4), round(b["ymin"] / h, 4),
-                                 round((b["xmax"] - b["xmin"]) / w, 4), round((b["ymax"] - b["ymin"]) / h, 4)]})
-        return out
+        for box, score, idx in zip(found["boxes"].tolist(), found["scores"].tolist(), found["labels"].tolist()):
+            x0, y0 = min(max(box[0] / w, 0.0), 1.0), min(max(box[1] / h, 0.0), 1.0)
+            x1, y1 = min(max(box[2] / w, 0.0), 1.0), min(max(box[3] / h, 0.0), 1.0)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            out.append({"label": labels[int(idx)], "confidence": round(min(max(float(score), 0.0), 1.0), 4),
+                        "bbox": [round(x0, 4), round(y0, 4), round(x1 - x0, 4), round(y1 - y0, 4)]})
+        return sorted(out, key=lambda o: -o["confidence"])
 
 
 _ADAPTERS = {"clip": ClipAdapter, "smolvlm": SmolVLMAdapter, "hf_zero_shot_detector": ZeroShotDetectorAdapter}

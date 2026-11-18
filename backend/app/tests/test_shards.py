@@ -89,6 +89,12 @@ def test_shards_are_closed_uploaded_and_cleaned(tmp_path, fixture_dir, monkeypat
     ws = Workspace(root)
     st = shards.ShardRunner(ws, None).load()
     assert st["index"] == 8 and st["gone"] == 1 and st["shards_done"][0]["name"] == "shard_0001"
+    with ws.db.session() as s:  # the hashes of what was exported stay behind for later shards to be compared against
+        from app.database.models import SeenHash
+
+        seen = list(s.query(SeenHash))
+    assert len(seen) == sum(e["records"] for e in st["shards_done"]) > 0 and all(r.shard.startswith("shard_") and r.phash for r in seen)
+    assert st["shards_done"][0]["stats"]["categories"] and "configs:" in uploads[0]["readme"] and "Licence notice" in uploads[0]["readme"]
     ws.db.dispose()
 
     again = runner.invoke(app, ["resume", *w])  # the target of 8 URLs is reached: nothing more to fetch

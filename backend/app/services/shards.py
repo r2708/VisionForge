@@ -31,7 +31,7 @@ from app.core.io import atomic_write_text, free_disk_gb
 from app.core.logging import get_logger
 from app.core.runlock import RunLock
 from app.core.workspace import Workspace
-from app.database.models import Embedding, Image, KV, Source, UrlItem, utcnow
+from app.database.models import Embedding, Image, KV, SeenHash, Source, StageResult, UrlItem, utcnow
 from app.database.session import kv_get, kv_set
 from app.services import hf_upload
 
@@ -327,6 +327,7 @@ class ShardRunner:
         self.ws, self.con, self.quiet = ws, console, quiet
         self.cfg = ws.config
         self.sh = self.cfg.shards
+        self.captions = None  # CaptionIndex when shards.caption_dataset is set
 
     # ---- state ----------------------------------------------------------
     def load(self) -> Optional[dict]:
@@ -510,6 +511,7 @@ class ShardRunner:
                     md5s[k] = hashlib.md5(data).hexdigest() if data else None
                 with self.ws.db.session() as s:
                     seen = set(s.scalars(select(UrlItem.md5).where(UrlItem.md5.in_([m for m in md5s.values() if m]), UrlItem.status == "ok")))
+                supplied = self.captions.lookup(str(row.get(id_col) or "") for row in rows) if self.captions and id_col else {}
                 for k, row in enumerate(rows):
                     idx = state["index"] + k
                     rid = str(row.get(id_col) or f"{stem}_{start + k:06d}") if id_col else f"{stem}_{start + k:06d}"
@@ -534,12 +536,17 @@ class ShardRunner:
                         os.replace(tmp, dest / name)
                         status, detail = "ok", ""
                         stats["bytes"] += len(data)
-                        meta_lines.append(json.dumps({"relative_path": name, "source_url": f"https://huggingface.co/datasets/{repo}",
-                                                      "license": state["license"], "notes": f"{repo} {rel} image_id={rid}"}))
+                        caption, origin = supplied.get(str(row.get(id_col) or ""), (None, None)) if id_col else (None, None)
+                        stats["with_caption"] = stats.get("with_caption", 0) + bool(caption)
+                        # The original web address of the image when the caption dataset records it, else the source dataset.
+                        meta_lines.append(json.dumps({"relative_path": name, "source_url": origin or f"https://huggingface.co/datasets/{repo}",
+                                                      "license": state["license"], "notes": f"{repo} {rel} image_id={rid}",
+                                                      **({"caption": caption} if caption else {})}))
                     stats[status] += 1
                     stats["urls"] += 1
                     if status == "ok":
-                        self.con.item("EXTRACT", f"row_{idx:09d}", True, f"{rid[:16]}….{ext} ({len(data) / 1024**2:.2f} MB)", 0.0)
+                        self.con.item("EXTRACT", f"row_{idx:09d}", True, f"{rid[:16]}….{ext} ({len(data) / 1024**2:.2f} MB)"
+                                      + (", caption from source" if caption else (", no source caption" if self.captions else "")), 0.0)
                     else:
                         self.con.item("EXTRACT", f"row_{idx:09d}", status == "duplicate", f"{status}: {detail}", 0.0)
                     ledger.append(dict(id=idx, url=f"hf://{repo}/{rel}#{rid}", md5=md5s[k], size=len(data) if data else None,
@@ -551,6 +558,7 @@ class ShardRunner:
                 state["index"] += len(rows)
                 for k2, sk in (("ok", "downloaded"), ("failed", "failed"), ("duplicate", "duplicates"), ("too_large", "too_large"), ("unsupported", "unsupported")):
                     state[sk] = state.get(sk, 0) + sum(1 for r in ledger if r["status"] == k2)
+                state["with_source_caption"] = state.get("with_source_caption", 0) + sum(1 for line in meta_lines if '"caption": ' in line)
                 with self.ws.db.session() as s:  # checkpoint: ledger rows and cursor together
                     for r in ledger:
                         s.merge(UrlItem(**r))
@@ -591,6 +599,8 @@ class ShardRunner:
         cfg.paths.sources = [SourceCfg(path=str(folder), label=self.shard_name(state["shard"]),
                                        rights_status=state["rights_status"], license=state["license"],
                                        metadata_file="metadata.jsonl" if (folder / "metadata.jsonl").is_file() else None)]
+        if "parquet" not in cfg.export.formats:
+            cfg.export.formats.append("parquet")  # the dataset page reads the typed parquet manifests
         cfg = PipelineConfig.model_validate(cfg.model_dump())
         self.ws.save_config(cfg)
         self.cfg, self.sh = self.ws.config, self.ws.config.shards
@@ -615,6 +625,14 @@ class ShardRunner:
             shutil.rmtree(dest)
         shutil.move(str(self.ws.output_dir), str(dest))
         self.con.progress("shards", {"message": f"{name} closed: {records} records, {size_mb} MB"})
+        # Keep the hashes of what this shard exported, so later shards can be compared against it.
+        with self.ws.db.session() as s:
+            hashes = dict(s.execute(select(StageResult.image_pk, StageResult.data)
+                                    .where(StageResult.stage == "phash", StageResult.status == "done")).all())
+            exported = s.execute(select(Image.id, Image.image_id, Image.sha256).where(
+                Image.decision == "accepted", Image.split.is_not(None), Image.processed_path.is_not(None), Image.missing.is_(False))).all()
+            s.add_all(SeenHash(sha256=sha, phash=(hashes.get(pk) or {}).get("phash"), dhash=(hashes.get(pk) or {}).get("dhash"),
+                               image_id=image_id, shard=name) for pk, image_id, sha in exported)
         # Forget the per-image working state of this shard (the ledger of URLs is kept).
         with self.ws.db.session() as s:
             shas = list(s.scalars(select(Image.sha256)))
@@ -629,10 +647,26 @@ class ShardRunner:
                     s.delete(row)
         shutil.rmtree(self.download_dir(state["shard"]), ignore_errors=True)  # our own downloaded copies
         shutil.rmtree(self.ws.cache_dir, ignore_errors=True)
-        state["pending_upload"].append({"name": name, "records": records, "size_mb": size_mb})
+        state["pending_upload"].append({"name": name, "records": records, "size_mb": size_mb, "stats": self.shard_stats(dest)})
         state["shard"] += 1
         self.save(state)
         self.upload_pending(state)
+
+    @staticmethod
+    def shard_stats(folder: Path) -> dict:
+        """Counts kept for the dataset page, read from the reports of a closed shard."""
+        def load(name: str) -> dict:
+            try:
+                return json.loads((folder / "reports" / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {}
+
+        summary, coverage, quality = load("dataset_summary.json"), load("coverage_report.json"), load("quality_report.json")
+        counts = summary.get("counts", {})
+        return {"registered": counts.get("images_registered"), "excluded": counts.get("excluded"), "splits": counts.get("splits"),
+                "caption_sources": summary.get("caption_sources") or {},
+                "categories": (coverage.get("distributions") or {}).get("category") or {},
+                "exclusion_reasons": (quality.get("curation") or {}).get("reasons") or {}}
 
     def upload_pending(self, state: dict) -> None:
         hf = self.cfg.huggingface
@@ -670,26 +704,229 @@ class ShardRunner:
                                                     + ("; local copy removed" if self.sh.delete_after_upload else "")})
 
     def root_readme(self, state: dict, done: list[dict]) -> str:
+        """The dataset page on Hugging Face: what the dataset holds, how it was built and how to load it."""
+        from collections import Counter
+
+        from app.models.hub import load_registry
+        from app.pipeline.runner import describe_pipeline
+        from app.pipeline.vision import labels as L
+        from app.services.card import pipeline_steps
+
+        cfg, hf = self.cfg, self.cfg.huggingface
         total = sum(e["records"] for e in done)
         size = sum(e["size_mb"] for e in done)
-        mode = self.cfg.project.mode
-        task = {"text_to_image": "text-to-image", "vision_language": "image-to-text", "general_multimodal": "text-to-image"}[mode]
-        lines = ["---", f"pretty_name: {json.dumps(self.cfg.project.name)}", "task_categories:", f"- {task}", "tags:",
-                 "- image-dataset-pipeline", "---", "", f"# {self.cfg.project.name}", "",
-                 f"Image-caption dataset built in shards by image-dataset-pipeline. **{total} records in {len(done)} shard(s), "
-                 f"{size / 1024:.2f} GB.**", "",
-                 "Each folder under `shards/` is a self-contained dataset: `images/`, `manifests/` (train / validation / test), "
-                 "`metadata/`, `reports/` and its own `dataset_card.md` with filters, transformations and limitations.", "",
-                 "## Source and licence", "",
-                 f"Images were downloaded from the URLs in the builder's source lists. Licence as recorded by the builder: "
-                 f"**{state['license']}**. Each record keeps its `source_url`. Licences were not verified by the tool, and per-image "
-                 "author attribution is not included; check the original source before reuse.", "",
-                 "## Caveats", "",
-                 "- Captions, categories and quality scores are model-generated or heuristic; see each shard's dataset card.",
-                 "- Duplicates are removed inside a shard and exact duplicates across shards; near-duplicates across shards and "
-                 "across the train/validation/test splits of different shards are not checked.", "",
-                 "## Shards", "", "| shard | records | size (MB) |", "|---|---:|---:|"]
-        lines += [f"| {e['name']} | {e['records']} | {e['size_mb']} |" for e in done]
+        task = {"text_to_image": "text-to-image", "vision_language": "image-to-text", "general_multimodal": "text-to-image"}[cfg.project.mode]
+        bucket = next((name for limit, name in ((1_000, "n<1K"), (10_000, "1K<n<10K"), (100_000, "10K<n<100K"),
+                                                (1_000_000, "100K<n<1M")) if total < limit), "1M<n<10M")
+        url = next((e["repo_url"] for e in done if e.get("repo_url")), None)
+        repo_id = url.rsplit("/datasets/", 1)[-1] if url else (hf.repo_id if "/" in (hf.repo_id or "") else f"<user>/{hf.repo_id}")
+        title = repo_id.rsplit("/", 1)[-1] if hf.repo_id else cfg.project.name
+        today = utcnow().strftime("%Y-%m-%d")
+        sp, c = cfg.splits, cfg.captioning
+        stages = [st for st in describe_pipeline(self.ws, cfg) if st["name"] != "hf_upload"]
+        on = {st["name"]: st["enabled"] for st in stages}
+        registry = load_registry(self.ws.root)
+        captioner = getattr(registry.get(cfg.models.captioner), "repo", cfg.models.captioner)
+        if state.get("kind") == "hf":
+            origin = (f"the public Hugging Face dataset [{state['repo']}](https://huggingface.co/datasets/{state['repo']}) "
+                      "(images read from its parquet files)")
+        else:
+            origin = "the URLs in the builder's source lists"
+        seen = f"{state['index']:,}" + (f" of {state['total_urls']:,}" if state.get("total_urls") else "")
+        skipped = {"no longer available": state.get("gone", 0), "download failed": state.get("failed", 0),
+                   "listed twice": state.get("duplicates", 0), "unsupported format": state.get("unsupported", 0),
+                   "over the file size limit": state.get("too_large", 0)}
+        skipped_text = ", ".join(f"{v:,} {k}" for k, v in skipped.items() if v) or "none"
+
+        def summed(key: str) -> Counter:
+            out: Counter = Counter()
+            for e in done:
+                out.update((e.get("stats") or {}).get(key) or {})
+            return out
+
+        sources, categories, reasons = summed("caption_sources"), summed("categories"), Counter()
+        for reason, n in summed("exclusion_reasons").items():
+            reasons[reason.split(":")[0]] += n
+        caption_names = {c.supplied_source: (f"`{c.supplied_source}`: caption that came with the source image"
+                                             + (f" ([{self.sh.caption_dataset}](https://huggingface.co/datasets/{self.sh.caption_dataset}))"
+                                                if self.sh.caption_dataset else "")),
+                         "vlm": f"`vlm`: generated by the local model `{captioner}`",
+                         "template_baseline": "`template_baseline`: template sentence built from the automatic annotations",
+                         "user_edited": "`user_edited`: edited by a person during review"}
+        if sources:
+            caption_cell = "; ".join(f"{n:,} {name} ({n / max(1, total):.0%})" for name, n in sources.most_common())
+        else:
+            caption_cell = {"auto": "source captions, a local model for the rest", "template": "template sentences",
+                            "smolvlm": "a local model", "sidecar": "supplied captions"}.get(c.adapter, c.adapter)
+
+        lines = ["---", f"pretty_name: {json.dumps(title)}", "task_categories:", f"- {task}", "tags:",
+                 "- image-dataset-pipeline", "size_categories:", f"- {bucket}",
+                 # Without explicit configs the Hub tries to read every JSONL file of every shard as one table and fails.
+                 "configs:", "- config_name: default", "  default: true", "  data_files:", "  - split: all",
+                 "    path: shards/*/images/**", "- config_name: records", "  data_files:",
+                 *[x for k in ("train", "validation", "test") for x in (f"  - split: {k}", f"    path: shards/*/manifests/{k}.parquet")],
+                 "---", "", f"# {title}", "",
+                 "> **Licence notice.** The images come from many web sources and keep the copyright and licence of their "
+                 "original source. No licence was verified per image by the builder of this dataset. Check the original source "
+                 "of an image (`source_url` in each record) before you redistribute it or use it commercially.", "",
+                 f"Image-caption dataset for {task} training, built and uploaded in shards by image-dataset-pipeline "
+                 f"{cfg.project.pipeline_version}. Every image went through validation, quality scoring, duplicate removal, "
+                 "automatic annotation, captioning, caption verification and a leakage-safe train / validation / test split "
+                 "before export. The dataset is still growing: a new shard is added each time about "
+                 f"{self.target_mb() / 1024:.3g} GB of accepted images is ready.", "",
+                 "| | |", "|---|---|",
+                 f"| Records | **{total:,}** image-caption pairs |",
+                 f"| Shards | {len(done)} |",
+                 f"| Size | {size / 1024:.2f} GB |",
+                 f"| Splits | train {sp.train:g} / validation {sp.validation:g} / test {sp.test:g}, inside each shard |",
+                 f"| Captions | {caption_cell} |",
+                 f"| Source images read so far | {seen} |",
+                 f"| Last updated | {today} |", "",
+                 "## Repository layout", "",
+                 "Each folder under `shards/` is a complete dataset on its own, with paths relative to that folder.", "",
+                 "```", "shards/", "  shard_0001/",
+                 "    images/                  accepted images, named <image_id>.<ext>, and metadata.jsonl (the default configuration)",
+                 "    manifests/",
+                 "      minimal_{train,validation,test}.jsonl   {\"image\": \"images/...\", \"text\": \"caption\"}",
+                 "      {train,validation,test}.parquet         typed columns per split (the `records` configuration)",
+                 "      {train,validation,test}.jsonl|csv       full nested records per split",
+                 "      all_records.jsonl|csv|parquet           every exported record",
+                 "    metadata/                annotations, captions, image metadata, provenance, quality scores",
+                 "    rejected/                rejected_records.jsonl: excluded images with the reasons",
+                 "    reports/                 dataset summary, quality, duplicates, alignment, rights, coverage, leakage, validation",
+                 "    dataset_card.md          card of this shard: counts, thresholds, warnings",
+                 "    SHA256SUMS               checksum of every file in the shard",
+                 "  shard_0002/", "  ...", "```", "",
+                 "## How the dataset is built", "",
+                 f"Source: {origin}. Source images are processed in batches; each batch runs through the steps below, "
+                 "and the accepted images accumulate until a shard is full.", ""]
+        lines += pipeline_steps(cfg, stages, registry)
+        lines += ["", f"Source images skipped before processing: {skipped_text}.", ""]
+
+        lines += ["## Captions", ""]
+        if c.adapter == "auto":
+            lines += [f"A caption is taken from the source data when the image has one"
+                      + (f": [{self.sh.caption_dataset}](https://huggingface.co/datasets/{self.sh.caption_dataset}) is joined to the "
+                         "images by the hash of the original image address" if self.sh.caption_dataset else "")
+                      + f". Only images without such a caption are sent to the local model `{captioner}`, which writes two or "
+                      "three sentences per image.", ""]
+            if self.sh.caption_dataset == "allenai/pixmo-cap":
+                lines += ["PixMo-Cap captions were made by annotators who described each image aloud for 60 to 90 seconds; a "
+                          "language model turned the transcripts into one long description (about 170 words on average). They are "
+                          "licensed ODC-BY 1.0 by the Allen Institute for AI, which asks for attribution and intends them for "
+                          "research and educational use. In each record the full description is the `comprehensive` caption, its "
+                          "opening sentences (up to about 75 words) are the `detailed` caption, and its first sentence is the "
+                          "`short` caption.", ""]
+        lines += [f"The `{c.training_caption_field}` caption is the `text` column. `captions.source` in each record says where a "
+                  "caption came from:", ""]
+        lines += [f"- {caption_names.get(name, f'`{name}`')}: {n:,} records" for name, n in sources.most_common()] or [
+            f"- {v}" for k, v in caption_names.items() if k in ((c.supplied_source, "vlm") if c.adapter == "auto" else ())]
+        lines += [""]
+        if on.get("alignment"):
+            lines += ["Each caption is then checked against its image with CLIP, a model that took no part in writing the caption"
+                      + (" (this does not hold for template captions, which are built from CLIP labels)" if c.adapter == "template" else "")
+                      + ". " + ("Records that fail the check are kept out of the dataset. " if c.quarantine_failed_verification else "")
+                      + "A caption fails when its similarity to the image is too low. Caption words from a fixed vocabulary are "
+                      "also tested one by one, and those findings are stored as warnings on the record without excluding it. "
+                      "The check catches captions that do not match the image; it does not prove that a caption is correct.", ""]
+
+        if categories:
+            n_cat = sum(categories.values())
+            uniform = n_cat / len(L.LABEL_SETS["categories"])
+            lines += ["## Category balance", "",
+                      f"Primary category of the {n_cat:,} exported records, assigned by CLIP zero-shot classification over "
+                      f"{len(L.LABEL_SETS['categories'])} fixed categories (an inference, not a human label). An even spread would "
+                      f"be {1 / len(L.LABEL_SETS['categories']):.1%} per category.", "",
+                      "| category | records | share | vs. even spread |", "|---|---:|---:|---|"]
+            for label, n in sorted(categories.items(), key=lambda kv: -kv[1]):
+                ratio = n / uniform
+                mark = "over-represented" if ratio > 2.5 else ("under-represented" if ratio < 0.25 else "")
+                lines.append(f"| {label} | {n:,} | {n / n_cat:.1%} | {ratio:.1f}x {mark}".rstrip() + " |")
+            absent = sorted({lbl for lbl, _ in L.LABEL_SETS["categories"]} - set(categories))
+            top, low = max(categories.values()), min(categories.values())
+            lines += ["", f"Largest to smallest category: {top / max(1, low):.0f} to 1."
+                      + (f" Categories with no records: {', '.join(absent)}." if absent else "")
+                      + " No balancing is applied; each shard's `reports/coverage_report.json` also has the style, lighting, "
+                      "scene, orientation and format distributions.", ""]
+
+        if reasons:
+            lines += ["## Why images were left out", "",
+                      "Images of the closed shards that did not enter the dataset, by reason (an image can have several):", "",
+                      "| reason | images |", "|---|---:|"]
+            lines += [f"| `{reason}` | {n:,} |" for reason, n in reasons.most_common(12)] + [""]
+
+        lines += ["## What a record contains", "",
+                  "The full manifests (`train.jsonl` and the others) hold one JSON object per image:", "",
+                  "| Field | Content |", "|---|---|",
+                  "| `image_id`, `image_path` | stable ID and path of the image inside the shard |",
+                  "| `source` | source file name, source SHA-256, `source_url`, licence text, rights status |",
+                  "| `processed_image` | format, width, height, aspect ratio, SHA-256, transformations applied, resolution bucket |",
+                  "| `captions` | `short`, `detailed`, `comprehensive`, `generation_prompt`, and `source` (where the caption came from) |",
+                  "| `visual_annotations` | categories, style, lighting, scene, colour palette, composition, camera attributes, "
+                  "detected objects and their relationships, text read in the image, face count, watermark flag, tags |",
+                  "| `quality` | overall score and its components (sharpness, noise, exposure, contrast, compression, composition, aesthetic), flags |",
+                  "| `alignment` | image-text alignment score, verification status, warnings |",
+                  "| `deduplication` | duplicate group IDs and whether the image is the representative of its group |",
+                  "| `curation` | decision, review status, split, split seed |",
+                  "| `processing` | model versions, pipeline version, configuration hash, timestamp |", "",
+                  "Every record is validated against a typed schema before export: nested fields have declared types, boxes and "
+                  "confidences are fractions between 0 and 1, scores stay in their documented range. A record that does not "
+                  "validate is not exported.", "",
+                  "## Loading", "",
+                  "The repository has two configurations with fixed schemas:", "",
+                  "| Configuration | Splits | Columns |", "|---|---|---|",
+                  "| `default` | `all` | `image`, `text` (the caption), `split` (train / validation / test), `image_id` |",
+                  "| `records` | `train`, `validation`, `test` | typed metadata columns (captions, tags, categories, scores, flags, "
+                  "source and licence fields) and `record_json`, the complete record as JSON text; no image data |", "",
+                  "```python", "from datasets import load_dataset", "",
+                  f"ds = load_dataset(\"{repo_id}\", split=\"all\")            # images with captions",
+                  "train = ds.filter(lambda split: split == \"train\", input_columns=\"split\")", "",
+                  f"records = load_dataset(\"{repo_id}\", \"records\")           # metadata only, already split",
+                  "```", "",
+                  "`image_path` in `records` is relative to the shard folder the row came from. The nested JSONL manifests are "
+                  "not part of a configuration because their nested fields have no fixed type; read them with `json` if needed.", "",
+                  "## Source and licence", "",
+                  f"Images come from {origin}. Licence as recorded by the builder: **{state['license']}**. "
+                  "`source_url` in a record is the original web address of the image when the caption dataset records it, and the "
+                  "address of the source dataset otherwise. Licences were not verified by the tool, and per-image author "
+                  "attribution is not included; check the original source before reuse.", "",
+                  "## Human review", "",
+                  "No person has reviewed the records of this dataset, and no human-labelled benchmark exists for it. "
+                  + ("The PixMo-Cap captions originate from human annotators, as described above; that is the only human input. "
+                     if self.sh.caption_dataset == "allenai/pixmo-cap" else "")
+                  + "Categories, quality scores, detected objects, text read in images and the caption check are automatic and "
+                  "unmeasured against human labels. `curation.review_status` in each record shows whether a record is still "
+                  "waiting for review.", "",
+                  "## Limitations", ""]
+        if c.adapter == "template":
+            lines += ["- Captions are template sentences built from the automatic annotations. They describe the kind of image, "
+                      "setting, lighting and colours, and do not name specific objects or actions. The caption check uses the "
+                      "same signals, so it is not an independent verification."]
+        if c.adapter in ("auto", "smolvlm"):
+            lines += [f"- Captions written by `{captioner}` come from a very small model: they are short and can miss or invent "
+                      "details. The caption check removes the clearest mismatches, not all of them."]
+        limits = [
+            "- Categories, style, lighting, scene, aesthetic score, detected objects and text read in images are model "
+            "inferences and can be wrong. They have not been benchmarked against human labels for this dataset.",
+            "- Quality, aesthetic and alignment thresholds are the tool's defaults and were not tuned on this dataset.",
+            "- Watermarks are detected from text read in the image (agency names, copyright marks, credit lines). A "
+            "watermark without readable text, such as a faint logo, is not detected."
+            if on.get("ocr") else "- Watermarks are not detected: text reading (OCR) was not run.",
+        ]
+        if cfg.deduplication.cross_shard:
+            limits += ["- Duplicates are removed inside a shard. Across shards, exact copies and perceptual duplicates (re-encoded "
+                       "or resized copies) of an already exported image are removed; a cropped or edited version of an image in "
+                       "another shard is not detected, and neither are different photos of the same subject.",
+                       "- Each shard has its own train / validation / test split. Since duplicates of earlier shards are removed, "
+                       "the same picture does not appear in two splits; similar pictures of one subject in different shards can."]
+        else:
+            limits += ["- Duplicates are removed inside a shard, and exact duplicates across shards. Near-duplicates across shards, "
+                       "and across the train / validation / test splits of different shards, are not checked."]
+        limits += ["- Images can contain people, text and logos."]
+        lines += limits + ["", "## Shards", "", "| shard | records | size (MB) | uploaded |", "|---|---:|---:|---|"]
+        lines += [f"| {e['name']} | {e['records']:,} | {e['size_mb']} | {(e.get('uploaded_at') or today)[:10]} |" for e in done]
+        if not done:
+            lines += ["", "No shard has been published yet."]
         return "\n".join(lines) + "\n"
 
     # ---- main loop ------------------------------------------------------
@@ -717,6 +954,11 @@ class ShardRunner:
             self.prefetch.start()
             self.con.progress("download", {"message": f"background download on: up to {window} source file(s) kept on disk "
                                                       "(the one being processed + the next ones)"})
+        if self.sh.caption_dataset and state.get("kind") == "hf":
+            from app.services.caption_source import CaptionIndex
+
+            self.captions = CaptionIndex(self.ws.root, self.sh.caption_dataset, lambda m: self.con.progress("download", {"message": m}))
+            self.captions.ensure(_ssl_context(), max(60.0, self.sh.timeout_s))
         self.upload_pending(state)  # shards closed earlier whose upload did not finish
         accept = 0.6  # share of downloaded bytes that ends up in the dataset; refined from this shard
         first = True

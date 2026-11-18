@@ -4,6 +4,8 @@ Resuming a job simply runs the stage list again: every per-image stage skips wor
 idempotency key is unchanged, so completed images are never processed twice."""
 from __future__ import annotations
 
+import os
+
 import secrets
 import threading
 import time
@@ -127,7 +129,9 @@ def mark_interrupted(ws: Workspace) -> int:
     """Recover after a crash or kill: when no live process holds the run lock, every job and
     stage still marked running is turned into ``interrupted`` so it can be resumed. While a run
     is alive (in this or another terminal) nothing is touched."""
-    if RunLock(ws.checkpoints_dir).owner() is not None:
+    # A lock held by this very process (shard mode takes it before starting a job) says nothing about
+    # an earlier process: a job it left behind as "running" was cut short and must become resumable.
+    if RunLock(ws.checkpoints_dir).owner() not in (None, os.getpid()):
         return 0
     n = 0
     with ws.db.session() as s:

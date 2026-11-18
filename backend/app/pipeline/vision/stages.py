@@ -31,6 +31,27 @@ def load_embedding(ctx: StageContext, sha256: str, model_key: str):
         return None if row is None else np.frombuffer(row.vector, dtype=np.float32).copy()
 
 
+def release_model(ctx: StageContext, stage, attribute: str, key) -> None:
+    """Free a stage's model when the stage is done. Both references have to go (the stage's own and
+    the hub's) or the weights stay in memory: on an 8 GB machine three models held at once pushed the
+    system into swap and made the whole computer sluggish. The next stage that needs the model loads
+    it again, which takes a few seconds."""
+    from app.pipeline.base import _free_memory
+
+    setattr(stage, attribute, None)
+    if key:
+        ctx.hub.unload(key)
+    else:
+        _free_memory()
+
+
+def worth_annotating(ctx: StageContext, img) -> bool:
+    """False for images that are already certain to be rejected for their size: the slow optional
+    annotators (text reading, object detection) are not spent on them."""
+    q = ctx.cfg.quality
+    return img.manual_decision == "accepted" or not (img.width and img.height and (img.width < q.min_width or img.height < q.min_height))
+
+
 # ------------------------------------------------------------------ embeddings
 class EmbeddingStage(ImageStage):
     name = "embedding"
@@ -61,6 +82,9 @@ class EmbeddingStage(ImageStage):
     def setup(self, ctx):
         self.clip = ctx.hub.get(ctx.cfg.models.embedding)
         self.model_key = f"{self.clip.spec.key}@{self.clip.revision}"
+
+    def teardown(self, ctx):
+        release_model(ctx, self, "clip", ctx.cfg.models.embedding)
 
     def process_batch(self, ctx, refs):
         out: list = [None] * len(refs)
@@ -135,6 +159,9 @@ class ZeroShotStage(ImageStage):
         self.text = {name: self.clip.encode_texts([p for _, p in items]) for name, items in L.LABEL_SETS.items()}
         self.aes = [(self.clip.encode_texts([a])[0], self.clip.encode_texts([b])[0]) for a, b in L.AESTHETIC_PAIRS]
         self.wm = self.clip.encode_texts(L.WATERMARK_PROMPTS)
+
+    def teardown(self, ctx):
+        release_model(ctx, self, "clip", ctx.cfg.models.embedding)
 
     def process(self, ctx, ref: ImgRef) -> dict:
         v = load_embedding(ctx, ref.sha256, ref.deps["embedding"]["model_key"])
@@ -227,10 +254,16 @@ class OcrStage(ImageStage):
 
         return {"name": "rapidocr-onnxruntime", "version": md.version("rapidocr-onnxruntime")}
 
+    def eligible(self, ctx, img):
+        return worth_annotating(ctx, img)
+
     def setup(self, ctx):
         from rapidocr_onnxruntime import RapidOCR
 
         self.engine = RapidOCR()
+
+    def teardown(self, ctx):
+        release_model(ctx, self, "engine", None)
 
     def process(self, ctx, ref):
         img = analysis_rgb(ref.abs_path, 1280)
@@ -239,9 +272,10 @@ class OcrStage(ImageStage):
         regions, area = [], 0.0
         for box, text, conf in result or []:
             xs, ys = [p[0] for p in box], [p[1] for p in box]
-            x0, y0, x1, y1 = min(xs) / w, min(ys) / h, max(xs) / w, max(ys) / h
+            x0, y0 = min(max(min(xs) / w, 0.0), 1.0), min(max(min(ys) / h, 0.0), 1.0)
+            x1, y1 = min(max(max(xs) / w, 0.0), 1.0), min(max(max(ys) / h, 0.0), 1.0)
             area += max(0.0, x1 - x0) * max(0.0, y1 - y0)
-            regions.append({"text": text, "confidence": round(float(conf), 4),
+            regions.append({"text": text, "confidence": round(min(max(float(conf), 0.0), 1.0), 4),
                             "bbox": [round(x0, 4), round(y0, 4), round(x1 - x0, 4), round(y1 - y0, 4)]})
         confident = [r for r in regions if r["confidence"] >= 0.6]
         low_conf = len(regions) - len(confident)
@@ -362,11 +396,17 @@ class ObjectDetectionStage(ImageStage):
     def fingerprint(self, cfg):
         return cfg.models.detection_labels or L.DETECTION_LABELS
 
+    def eligible(self, ctx, img):
+        return worth_annotating(ctx, img)
+
     def model_info(self, ctx):
         return ctx.hub.info(ctx.cfg.models.object_detector)
 
     def batch_size(self, ctx):
         return 1
+
+    def chunk_size(self, ctx):
+        return 40  # about a minute of detection per checkpoint
 
     def setup(self, ctx):
         self.det = ctx.hub.get(ctx.cfg.models.object_detector)
@@ -377,3 +417,6 @@ class ObjectDetectionStage(ImageStage):
             raise ModelUnavailable("configured object_detector is not a detection model")
         objects = self.det.detect(analysis_rgb(ref.abs_path, 960), self.labels)
         return {"objects": objects, "relationships": spatial_relationships(objects), "status": "inferred"}
+
+    def teardown(self, ctx):
+        release_model(ctx, self, "det", ctx.cfg.models.object_detector)

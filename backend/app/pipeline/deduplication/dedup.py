@@ -13,7 +13,7 @@ from sqlalchemy import select, update
 
 from app.core.imageio import analysis_rgb
 from app.core.logging import get_logger
-from app.database.models import Embedding, Image, Source, StageResult
+from app.database.models import Embedding, Image, SeenHash, Source, StageResult
 from app.database.session import kv_set
 from app.pipeline.base import Cancelled, StageContext
 
@@ -80,6 +80,33 @@ def hamming_pairs(hashes: np.ndarray, threshold: int) -> list[tuple[int, int, in
                     if i < j:
                         found[(i, j)] = int(d[a, bb])
     return [(i, j, d) for (i, j), d in found.items()]
+
+
+def cross_hamming(new: np.ndarray, old: np.ndarray, threshold: int) -> dict[int, tuple[int, int]]:
+    """For each hash in ``new``, the closest hash in ``old`` within ``threshold`` bits:
+    {new index: (old index, distance)}. Same banding idea as ``hamming_pairs``, but only pairs
+    across the two sets are examined, so a large ``old`` set stays cheap."""
+    best: dict[int, tuple[int, int]] = {}
+    if not len(new) or not len(old):
+        return best
+    edges = np.linspace(0, 64, threshold + 2).astype(int)
+    for b in range(threshold + 1):
+        lo, width = int(edges[b]), int(edges[b + 1] - edges[b])
+        if width == 0:
+            continue
+        mask = np.uint64((1 << width) - 1)
+        old_key = (old >> np.uint64(lo)) & mask
+        order = np.argsort(old_key, kind="stable")
+        sorted_key = old_key[order]
+        new_key = (new >> np.uint64(lo)) & mask
+        starts, ends = np.searchsorted(sorted_key, new_key, "left"), np.searchsorted(sorted_key, new_key, "right")
+        for i in np.flatnonzero(ends > starts):
+            cand = order[starts[i]:ends[i]]
+            d = popcount64(old[cand] ^ new[i])
+            k = int(np.argmin(d))
+            if d[k] <= threshold and (int(i) not in best or d[k] < best[int(i)][1]):
+                best[int(i)] = (int(cand[k]), int(d[k]))
+    return best
 
 
 HASH_BRUTE_FORCE_LIMIT = 6000
@@ -302,6 +329,41 @@ def run_dedup(ctx: StageContext) -> dict:
                 status[m] = "duplicate"
                 duplicate_of[m] = best
 
+    # ---- earlier shards: exact copies and perceptual duplicates of images that were already exported
+    earlier: dict[int, str] = {}
+    if cfg.cross_shard:
+        with db.session() as s:
+            seen = s.execute(select(SeenHash.sha256, SeenHash.phash, SeenHash.dhash, SeenHash.image_id, SeenHash.shard)).all()
+        if seen:
+            say(f"comparing with {len(seen)} images exported in earlier shards")
+            by_seen_sha = {r.sha256: r for r in seen}
+            for pk in pks:
+                hit = by_seen_sha.get(info[pk].sha256)
+                if hit is not None:
+                    earlier[pk] = f"{hit.shard}/{hit.image_id}"
+            with_hash = [r for r in seen if r.phash and r.dhash]
+            if cfg.perceptual and with_hash and hashed:
+                old_p = np.array([int(r.phash, 16) for r in with_hash], dtype=np.uint64)
+                old_d = np.array([int(r.dhash, 16) for r in with_hash], dtype=np.uint64)
+                for i, (j, _) in cross_hamming(p_arr, old_p, cfg.perceptual_threshold).items():
+                    if hashed[i] not in earlier and int(popcount64(np.array([d_arr[i] ^ old_d[j]], dtype=np.uint64))[0]) <= cfg.perceptual_threshold + 6:
+                        earlier[hashed[i]] = f"{with_hash[j].shard}/{with_hash[j].image_id}"
+            # The rest of a duplicate group duplicates the same earlier image.
+            for g in cluster.groups():
+                ref = next((earlier[m] for m in g if m in earlier), None)
+                if ref:
+                    for m in g:
+                        earlier.setdefault(m, ref)
+            for pk in list(earlier):
+                if info[pk].dup_override == "keep":
+                    del earlier[pk]
+                else:
+                    status[pk] = "duplicate"
+                    duplicate_of.pop(pk, None)
+        report["earlier_shards"] = {"images_compared_against": len(seen), "duplicates_of_earlier_shards": len(earlier),
+                                    "method": "exact checksum, then pHash within the perceptual threshold confirmed by dHash",
+                                    "examples": [{"image_id": info[pk].image_id, "duplicate_of": ref} for pk, ref in list(earlier.items())[:200]]}
+
     def label(uf: UnionFind, prefix: str) -> tuple[dict[int, str], list[dict]]:
         mapping, groups = {}, []
         for g in uf.groups():
@@ -336,6 +398,7 @@ def run_dedup(ctx: StageContext) -> dict:
                     near_group=maps["near_group"].get(pk), semantic_group=maps["semantic_group"].get(pk),
                     representative_status=status[pk]))
         kv_set(s, "report:duplicates", report)
-        kv_set(s, "dedup:duplicate_of", {info[k].image_id: info[v].image_id for k, v in duplicate_of.items()})
+        kv_set(s, "dedup:duplicate_of", {info[k].image_id: info[v].image_id for k, v in duplicate_of.items()}
+               | {info[k].image_id: ref for k, ref in earlier.items()})
     return {k: report[k]["group_count"] for k in ("exact", "perceptual", "near", "semantic")} | {
-        "duplicate_images": report["duplicate_images"]}
+        "duplicate_images": report["duplicate_images"], "duplicates_of_earlier_shards": len(earlier)}

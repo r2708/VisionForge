@@ -11,7 +11,7 @@ from app.database.models import Image, StageResult
 from app.database.session import kv_set
 from app.pipeline.base import ImageStage, ImgRef, StageContext
 
-from .adapters import (SidecarAdapter, SmolVLMCaptionAdapter, TemplateAdapter, build_tags, grounded_facts)
+from .adapters import (AutoCaptionAdapter, SidecarAdapter, SmolVLMCaptionAdapter, TemplateAdapter, build_tags, grounded_facts)
 
 EMPTY_PHRASES = ("a beautiful image of", "a stunning image of", "an image of an image", "a picture of a picture",
                  "high quality", "8k", "4k", "masterpiece", "best quality")
@@ -27,7 +27,8 @@ class CaptioningStage(ImageStage):
 
     def describe(self, d):
         text = d.get("short") or d.get("detailed") or ""
-        return f'"{text[:90]}"' if text else "no caption"
+        origin = (d.get("caption_model") or d.get("source") or "") if d.get("adapter") == "auto" else ""
+        return (f"{origin}: " if origin else "") + (f'"{text[:90]}"' if text else "no caption")
 
     version = "1"
     title = "Captions, generation prompt and tags"
@@ -40,7 +41,7 @@ class CaptioningStage(ImageStage):
         c = ctx.cfg
         if c.stages.captioning is False or c.captioning.adapter == "none":
             return False, "captioning disabled (adapter: none)"
-        if c.captioning.adapter == "smolvlm":
+        if c.captioning.adapter in ("smolvlm", "auto"):
             st = ctx.hub.status(c.models.captioner)
             return st["usable"], st.get("reason", "")
         return True, ""
@@ -48,17 +49,23 @@ class CaptioningStage(ImageStage):
     def fingerprint(self, cfg):
         c = cfg.captioning
         adapter_version = {"template": TemplateAdapter().version(), "sidecar": SidecarAdapter().version(),
-                           "smolvlm": {"prompt_version": "smolvlm-prompts-1"}}.get(c.adapter)
+                           "smolvlm": {"prompt_version": "smolvlm-prompts-1"},
+                           "auto": {"prompt_version": "smolvlm-prompts-1", "template_version": "auto-2", "source": c.supplied_source}}.get(c.adapter)
         return [c.adapter, adapter_version, c.short_caption, c.detailed_caption, c.comprehensive_caption,
-                c.generation_prompt, c.alternate_caption_count, c.max_new_tokens, c.sidecar_extension]
+                c.generation_prompt, c.alternate_caption_count, c.max_new_tokens, c.sidecar_extension,
+                c.vlm_image_splitting if c.adapter == "auto" else None]
 
     def model_info(self, ctx):
-        if ctx.cfg.captioning.adapter == "smolvlm":
+        if ctx.cfg.captioning.adapter in ("smolvlm", "auto"):
             return ctx.hub.info(ctx.cfg.models.captioner)
         return {"name": ctx.cfg.captioning.adapter, "revision": None}
 
     def batch_size(self, ctx):
-        return 1 if ctx.cfg.captioning.adapter == "smolvlm" else 64
+        return 1 if ctx.cfg.captioning.adapter in ("smolvlm", "auto") else 64  # one at a time: each terminal line shows its own time
+
+    def chunk_size(self, ctx):
+        # Model captions are slow: save them every few images so a stop loses little work.
+        return 20 if ctx.cfg.captioning.adapter in ("smolvlm", "auto") else None
 
     def eligible(self, ctx, img: Image) -> bool:
         # Do not spend caption inference on images that are already excluded for hard reasons.
@@ -74,11 +81,17 @@ class CaptioningStage(ImageStage):
             self.adapter = TemplateAdapter()
         elif a == "sidecar":
             self.adapter = SidecarAdapter()
+        elif a == "auto":
+            self.adapter = AutoCaptionAdapter(ctx)
         else:
             self.adapter = SmolVLMCaptionAdapter(ctx.hub.get(ctx.cfg.models.captioner))
 
     def teardown(self, ctx):
-        if ctx.cfg.captioning.adapter == "smolvlm":
+        used_model = ctx.cfg.captioning.adapter == "smolvlm" or getattr(self.adapter, "vlm", None) is not None
+        if isinstance(self.adapter, AutoCaptionAdapter):
+            ctx.progress("captioning", {"message": self.adapter.summary()})
+        self.adapter = None  # drop the stage's own reference too, or the weights stay in memory
+        if used_model:
             ctx.hub.unload(ctx.cfg.models.captioner)
 
     def process(self, ctx: StageContext, ref: ImgRef) -> dict:
@@ -97,13 +110,14 @@ class CaptioningStage(ImageStage):
             warnings.append("low_information_caption")
         if any(p in main.lower() for p in EMPTY_PHRASES):
             warnings.append("empty_or_styling_phrase")
-        return {**out, "adapter": self.adapter.name, "source": self.adapter.source, **self.adapter.version(),
+        by_model = self.adapter.name == "smolvlm" or bool(out.get("caption_model"))
+        return {**out, "adapter": self.adapter.name, "source": out.get("source") or self.adapter.source, **self.adapter.version(),
                 "tags": build_tags(facts), "facts_used": facts, "warnings": warnings,
-                "settings": {"decoding": "greedy", "max_new_tokens": cfg.max_new_tokens} if self.adapter.name == "smolvlm" else {},
+                "settings": {"decoding": "greedy", "max_new_tokens": cfg.max_new_tokens} if by_model else {},
                 "generated_at": datetime.now(timezone.utc).isoformat()}
 
     def still_valid(self, ctx, img, data):
-        if data.get("adapter") != "sidecar":
+        if data.get("adapter") not in ("sidecar", "auto"):
             return True
         ref = ImgRef(pk=img.id, image_id=img.image_id, abs_path=img.abs_path, sha256=img.sha256, extension=img.extension,
                      file_name=img.file_name, relative_path=img.relative_path, width=img.width, height=img.height,

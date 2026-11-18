@@ -2,7 +2,7 @@
 validated against these models; invalid records are rejected and reported."""
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -58,39 +58,89 @@ class Inferred(_M):
     confidence: Optional[float] = None
 
 
+Box = Annotated[list[float], Field(min_length=4, max_length=4, description="x, y, width, height as fractions of the image")]
+Unit = Annotated[float, Field(ge=0, le=1)]
+Score = Annotated[Optional[float], Field(ge=0, le=100)]
+
+
+class DetectedObject(_M):
+    label: str = Field(min_length=1)
+    confidence: Unit
+    bbox: Box
+
+
+class Relationship(_M):
+    subject: str
+    relation: str
+    object: str
+    status: str
+    basis: str
+    confidence: Unit
+
+
+class PaletteColor(_M):
+    hex: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    name: str
+    fraction: Unit
+
+
+class TextRegion(_M):
+    text: str
+    confidence: Unit
+    bbox: Box
+
+
+class OcrResult(_M):
+    text: list[str] = Field(default_factory=list)
+    regions: list[TextRegion] = Field(default_factory=list)
+
+
+class People(_M):
+    face_count: Optional[int] = Field(None, ge=0)
+    status: Optional[str] = None
+    policy: Optional[str] = None
+
+
+class Segmentation(_M):
+    mask_path: str
+    foreground_fraction: Unit
+    bbox: Box
+    method: str
+
+
 class VisualAnnotations(_M):
     categories: list[str] = Field(default_factory=list)
-    objects: list[dict] = Field(default_factory=list)
+    objects: list[DetectedObject] = Field(default_factory=list)
     scene: Optional[str] = None
-    relationships: list[dict] = Field(default_factory=list)
+    relationships: list[Relationship] = Field(default_factory=list)
     lighting: list[str] = Field(default_factory=list)
     style: list[str] = Field(default_factory=list)
-    color_palette: list[dict] = Field(default_factory=list)
+    color_palette: list[PaletteColor] = Field(default_factory=list)
     composition: dict = Field(default_factory=dict)
     camera_attributes: dict[str, Inferred] = Field(default_factory=dict)
-    ocr: dict = Field(default_factory=lambda: {"text": [], "regions": []})
+    ocr: OcrResult = Field(default_factory=OcrResult)
     watermarks_detected: Optional[bool] = None
-    people: dict = Field(default_factory=dict)
-    segmentation: Optional[dict] = None
+    people: People = Field(default_factory=People)
+    segmentation: Optional[Segmentation] = None
     tags: list[str] = Field(default_factory=list)
     annotation_status: Literal["inferred", "not_computed"] = "inferred"
 
 
 class Quality(_M):
-    overall_score: Optional[float] = None
-    sharpness_score: Optional[float] = None
-    noise_score: Optional[float] = None
-    exposure_score: Optional[float] = None
-    contrast_score: Optional[float] = None
-    compression_score: Optional[float] = None
-    composition_score: Optional[float] = None
-    aesthetic_score: Optional[float] = None
+    overall_score: Score = None
+    sharpness_score: Score = None
+    noise_score: Score = None
+    exposure_score: Score = None
+    contrast_score: Score = None
+    compression_score: Score = None
+    composition_score: Score = None
+    aesthetic_score: Score = None
     resolution_status: Optional[str] = None
     flags: list[str] = Field(default_factory=list)
 
 
 class Alignment(_M):
-    score: Optional[float] = None
+    score: Optional[float] = Field(None, ge=0, le=1)
     raw_cosine: Optional[float] = None
     method: Optional[str] = None
     verification_status: str = "not_run"

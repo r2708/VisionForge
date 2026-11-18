@@ -96,7 +96,10 @@ def render(path: str, meta: dict, cfg, out_fmt: str) -> PILImage.Image:
             img = to_rgb(img)
     if cfg.convert_to_srgb and icc_bytes and not meta["icc"]["is_srgb"]:
         src = ImageCms.ImageCmsProfile(io.BytesIO(icc_bytes))
-        img = ImageCms.profileToProfile(img, src, ImageCms.createProfile("sRGB"), outputMode=img.mode)
+        if img.mode == "L" and src.profile.xcolor_space.strip() == "RGB":
+            img = img.convert("RGB")  # a grayscale file tagged with an RGB profile: the profile only applies to RGB pixels
+        # sRGB is an RGB space, so a grayscale image with a grayscale profile comes out as RGB.
+        img = ImageCms.profileToProfile(img, src, ImageCms.createProfile("sRGB"), outputMode="RGB" if img.mode == "L" else img.mode)
     if img.mode == "RGBA" and not keep_alpha:
         img = to_rgb(img, cfg.alpha_background) if meta["alpha_used"] else img.convert("RGB")
     if out_fmt == "JPEG" and img.mode == "RGBA":

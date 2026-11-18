@@ -163,7 +163,8 @@ class QualityCfg(_Section):
     min_aesthetic_score: Optional[float] = Field(None, ge=0, le=100)
     manual_review_band: tuple[float, float] = Field((55, 75), description="Overall scores inside [low, high] go to manual review.")
     weights: QualityWeights = Field(default_factory=QualityWeights)
-    reject_watermarked: bool = Field(False, description="Quarantine images with a likely watermark instead of only flagging them.")
+    review_min_aesthetic_score: Optional[float] = Field(10, ge=0, le=100, description="Images below this aesthetic signal are quarantined for review even when the overall score passes.")
+    reject_watermarked: bool = Field(True, description="Quarantine images with detected watermark text instead of only flagging them.")
     max_text_area_fraction: Optional[float] = Field(None, ge=0, le=1, description="Quarantine text-heavy images above this OCR area fraction.")
 
     @field_validator("manual_review_band")
@@ -190,6 +191,7 @@ class DedupCfg(_Section):
     semantic_threshold: float = Field(0.93, ge=0, le=1, description="Min embedding cosine for a semantic-similarity group.")
     non_representative_action: Literal["quarantine", "flag"] = Field("quarantine", description="Applied to exact/perceptual/near duplicates that are not the representative.")
     max_per_semantic_group: Optional[int] = Field(None, ge=1, description="Keep at most this many images per semantic group; others are quarantined.")
+    cross_shard: bool = Field(True, description="Shard mode: also compare against the hashes of images exported in earlier shards.")
 
     @field_validator("auto_delete")
     @classmethod
@@ -200,10 +202,15 @@ class DedupCfg(_Section):
 
 
 class CaptioningCfg(_Section):
-    adapter: Literal["none", "template", "sidecar", "smolvlm"] = Field(
+    adapter: Literal["none", "template", "sidecar", "smolvlm", "auto"] = Field(
         "template",
-        description="none | template (grounded baseline built from annotations) | sidecar (user-supplied captions) | smolvlm (local VLM).",
+        description="none | template (grounded baseline built from annotations) | sidecar (user-supplied captions) | smolvlm (local VLM) "
+                    "| auto (the caption that came with the source when there is one, otherwise the local VLM).",
     )
+    supplied_source: str = Field("user_supplied", description="Recorded as the caption source for captions that came with the source data.")
+    quarantine_failed_verification: bool = Field(True, description="Quarantine images whose caption failed verification.")
+    vlm_image_splitting: bool = Field(False, description="auto adapter: let the VLM look at the image as a grid of tiles. More detail, "
+                                                         "but roughly ten times the input and far slower on small machines.")
     short_caption: bool = True
     detailed_caption: bool = True
     comprehensive_caption: bool = True
@@ -312,6 +319,8 @@ class ShardsCfg(_Section):
     prefetch_files: int = Field(3, ge=1, le=10, description="Hugging Face sources: most source files kept on disk at once "
                                                            "(the one being processed plus the ones downloaded ahead in the background).")
     license_note: str = "CC BY 2.0 as listed by the source (not verified)"
+    caption_dataset: Optional[str] = Field(None, description="Hugging Face dataset with image_url and caption columns; its captions are "
+                                                             "joined to the source images by sha256(image_url), e.g. allenai/pixmo-cap.")
 
 
 class StorageCfg(_Section):

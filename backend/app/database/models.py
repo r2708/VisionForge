@@ -193,6 +193,19 @@ class Embedding(Base):
     __table_args__ = (UniqueConstraint("sha256", "model_key", name="uq_embedding"),)
 
 
+class SeenHash(Base):
+    """Hashes of images exported in shards that are already closed. The images themselves are gone
+    from the workspace by then; this ledger is what later shards are compared against."""
+
+    __tablename__ = "seen_hashes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    phash: Mapped[Optional[str]] = mapped_column(String(16))
+    dhash: Mapped[Optional[str]] = mapped_column(String(16))
+    image_id: Mapped[str] = mapped_column(String(40))
+    shard: Mapped[str] = mapped_column(String(40))
+
+
 class DecisionLog(Base):
     """Audit trail of automatic and manual decisions."""
 

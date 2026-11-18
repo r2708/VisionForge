@@ -77,13 +77,60 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
     atomic_write_text(path, buf.getvalue())
 
 
-def _write_parquet(path: Path, rows: list[dict], records: list[dict]) -> None:
+def parquet_schema():
+    """Explicit column types for the parquet manifests. Declaring them keeps every file of every
+    shard on one schema: an empty list or an all-null column never gets a guessed type."""
+    import pyarrow as pa
+
+    text, strings = pa.string(), pa.list_(pa.string())
+    return pa.schema([
+        ("image_id", text), ("image_path", text), ("split", text), ("text", text),
+        ("short_caption", text), ("detailed_caption", text), ("comprehensive_caption", text), ("generation_prompt", text),
+        ("caption_source", text), ("tags", strings), ("categories", strings), ("style", strings), ("lighting", strings),
+        ("scene", text), ("width", pa.int32()), ("height", pa.int32()), ("format", text), ("processed_sha256", text),
+        ("quality_score", pa.float64()), ("aesthetic_score", pa.float64()), ("alignment_score", pa.float64()),
+        ("verification_status", text), ("alignment_warnings", strings), ("quality_flags", strings),
+        ("watermark_text_detected", pa.bool_()), ("face_count", pa.int32()), ("ocr_text", strings), ("object_labels", strings),
+        ("review_status", text), ("source_id", text), ("source_relative_path", text), ("source_sha256", text),
+        ("license", text), ("rights_status", text), ("creator", text), ("attribution", text), ("source_url", text),
+        ("record_json", text),
+    ])
+
+
+def typed_row(rec: dict, caption_field: str) -> dict:
+    """One parquet row: flat, typed columns for filtering plus the complete record as JSON text."""
+    va, q, al = rec["visual_annotations"], rec["quality"], rec["alignment"]
+
+    def strings(values) -> list[str]:
+        return [str(v) for v in (values or []) if v is not None]
+
+    return {
+        "image_id": rec["image_id"], "image_path": rec["image_path"], "split": rec["curation"]["split"],
+        "text": rec["captions"].get(caption_field) or "",
+        "short_caption": rec["captions"]["short"], "detailed_caption": rec["captions"]["detailed"],
+        "comprehensive_caption": rec["captions"]["comprehensive"], "generation_prompt": rec["captions"]["generation_prompt"],
+        "caption_source": rec["captions"]["source"], "tags": strings(va["tags"]), "categories": strings(va["categories"]),
+        "style": strings(va["style"]), "lighting": strings(va["lighting"]), "scene": va["scene"],
+        "width": rec["processed_image"]["width"], "height": rec["processed_image"]["height"],
+        "format": rec["processed_image"]["format"], "processed_sha256": rec["processed_image"]["sha256"],
+        "quality_score": q["overall_score"], "aesthetic_score": q["aesthetic_score"], "alignment_score": al["score"],
+        "verification_status": al["verification_status"], "alignment_warnings": strings(al["warnings"]),
+        "quality_flags": strings(q["flags"]), "watermark_text_detected": va["watermarks_detected"],
+        "face_count": (va["people"] or {}).get("face_count"), "ocr_text": strings((va["ocr"] or {}).get("text")),
+        "object_labels": strings(o.get("label") for o in va["objects"]),
+        "review_status": rec["curation"]["review_status"], "source_id": rec["source"]["source_id"],
+        "source_relative_path": rec["source"]["relative_path"], "source_sha256": rec["source"]["sha256"],
+        "license": rec["source"]["license"], "rights_status": rec["source"]["rights_status"],
+        "creator": rec["source"]["creator"], "attribution": rec["source"]["attribution"],
+        "source_url": rec["source"]["source_url"], "record_json": json.dumps(rec, ensure_ascii=False),
+    }
+
+
+def _write_parquet(path: Path, records: list[dict], caption_field: str) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    cols = {k: [r[k] for r in rows] for k in (rows[0] if rows else {})}
-    cols["record_json"] = [json.dumps(r, ensure_ascii=False) for r in records]
-    table = pa.table(cols) if rows else pa.table({"record_json": pa.array([], pa.string())})
+    table = pa.Table.from_pylist([typed_row(r, caption_field) for r in records], schema=parquet_schema())
     tmp = path.with_suffix(".parquet.tmp")
     pq.write_table(table, tmp)
     tmp.replace(path)
@@ -195,11 +242,10 @@ def run_export(ctx: StageContext, formats: Optional[list[str]] = None) -> dict:
             _write_csv(out / f"manifests/{k}.csv", [f for f in flat if f["split"] == k])
             written.append(f"manifests/{k}.csv")
     if "parquet" in formats:
-        _write_parquet(out / "manifests/all_records.parquet", flat, records)
+        _write_parquet(out / "manifests/all_records.parquet", records, field)
         written.append("manifests/all_records.parquet")
         for k in SPLITS:
-            idx = [i for i, f in enumerate(flat) if f["split"] == k]
-            _write_parquet(out / f"manifests/{k}.parquet", [flat[i] for i in idx], [records[i] for i in idx])
+            _write_parquet(out / f"manifests/{k}.parquet", by_split[k], field)
             written.append(f"manifests/{k}.parquet")
 
     # ---- minimal text-to-image manifests
@@ -410,7 +456,12 @@ def run_export(ctx: StageContext, formats: Optional[list[str]] = None) -> dict:
     for name, obj in rep.items():
         atomic_write_json(out / "reports" / name, obj)
         written.append(f"reports/{name}")
-    card = dataset_card(summary, coverage, validation, leakage, sources, scan, cfg)
+    from app.models.hub import load_registry
+    from app.pipeline.runner import describe_pipeline
+    from app.services.card import pipeline_steps
+
+    steps = pipeline_steps(cfg, [st for st in describe_pipeline(ws, cfg) if st["name"] != "hf_upload"], load_registry(ws.root))
+    card = dataset_card(summary, coverage, validation, leakage, sources, scan, cfg, steps)
     atomic_write_text(out / "dataset_card.md", card)
     # Hugging Face shows README.md as the dataset page; same card with the hub's metadata header.
     task = {"text_to_image": "text-to-image", "vision_language": "image-to-text", "general_multimodal": "text-to-image"}[mode]
@@ -438,7 +489,7 @@ def _hist(values: list[float]) -> dict:
     return {f"{i * 10}-{i * 10 + 10}": bins.get(i, 0) for i in range(10)}
 
 
-def dataset_card(summary, coverage, validation, leakage, sources, scan, cfg) -> str:
+def dataset_card(summary, coverage, validation, leakage, sources, scan, cfg, steps=None) -> str:
     c = summary["counts"]
     L_ = []
     a = L_.append
@@ -452,6 +503,9 @@ def dataset_card(summary, coverage, validation, leakage, sources, scan, cfg) -> 
     a("- `images/` processed image files; `manifests/` training manifests; `metadata/` annotations for all images; "
       "`rejected/` excluded records with reasons; `reports/` quality, duplicate, alignment, rights, coverage and leakage reports; "
       "`SHA256SUMS` package checksums.\n")
+    if steps:
+        a("## Processing steps\n")
+        a("\n".join(steps) + "\n")
     a("## Sources and licences\n")
     if sources:
         a("| Source | Licence | Rights status | Creator | URL |\n|---|---|---|---|---|")

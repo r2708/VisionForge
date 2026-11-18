@@ -4,6 +4,8 @@ Cheap by design: it only combines cached component metrics, so changing weights,
 dimensions or buckets re-runs this stage without touching pixels or models."""
 from __future__ import annotations
 
+import re
+
 import math
 from typing import Optional
 
@@ -30,7 +32,7 @@ class QualityAggregateStage(ImageStage):
         flags = f", flags: {', '.join(d['flags'][:4])}" if d["flags"] else ""
         return f"overall {d['overall_score']}, resolution {d['resolution_status']}{flags}"
 
-    version = "1"
+    version = "3"
     title = "Resolution suitability and overall quality"
     processes = "16, 28"
     depends = ("validate", "quality_technical")
@@ -79,11 +81,11 @@ class QualityAggregateStage(ImageStage):
             flags.append("below_min_resolution")
         elif bucket is None:
             flags.append("below_smallest_bucket")
-        if zs and zs["watermark"]["likely"]:
-            flags.append("watermark_likely")
         if ocr:
             flags += ocr.get("flags", [])
-            if any(_looks_like_watermark(r) for r in ocr.get("regions", [])):
+            regions = ocr.get("regions", [])
+            sparse = len(regions) <= SPARSE_TEXT_REGIONS
+            if any(_looks_like_watermark(r, sparse) for r in regions):
                 flags.append("watermark_text_detected")
 
         reasons = []
@@ -104,7 +106,25 @@ class QualityAggregateStage(ImageStage):
         img.quality_score = data["overall_score"]
 
 
-def _looks_like_watermark(region: dict) -> bool:
-    text = region.get("text", "").lower()
-    markers = ("©", "(c)", "www.", ".com", "shutterstock", "getty", "istock", "alamy", "dreamstime", "adobe stock", "watermark")
-    return any(m in text for m in markers)
+STOCK_MARKS = ("shutterstock", "gettyimages", "getty images", "istock", "alamy", "dreamstime", "adobe stock", "adobestock",
+               "depositphotos", "123rf", "bigstock", "fotolia", "freepik", "vecteezy", "watermark")
+_CREDIT = re.compile(r"©|\(c\)|\bcopyright\b|\ball rights reserved\b|\bphoto(graph)?s?\s*(by\b|credit|:)|\bimage\s*(by\b|credit|:)", re.I)
+SPARSE_TEXT_REGIONS = 6  # a photo with a credit line has a few text regions; a screenshot or a document has many
+_ADDRESS = re.compile(r"\bwww\.|\b[\w-]{3,}\.(com|net|org|co|io|tv|me|de|ru|uk|fr|in)\b|(^|\s)@[\w.]{3,}", re.I)
+
+
+def _looks_like_watermark(region: dict, sparse_text: bool = True) -> bool:
+    """Text that reads like a watermark or credit line. A stock-agency name or a copyright mark counts
+    anywhere. A web address or @handle counts only as a small line near an edge of an image with little
+    other text: on a sample of real images, addresses inside screenshots of web pages and apps were the
+    false alarms, and those images are full of text."""
+    text = region.get("text", "")
+    if region.get("confidence", 1.0) < 0.6 or not text.strip():
+        return False
+    low = text.lower()
+    if any(m in low for m in STOCK_MARKS) or _CREDIT.search(text):
+        return True
+    box = region.get("bbox") or [0, 0, 1, 1]
+    x, y, w, h = box
+    near_edge = min(x, y, 1 - (x + w), 1 - (y + h)) < 0.06
+    return sparse_text and bool(_ADDRESS.search(text)) and near_edge and w * h < 0.02

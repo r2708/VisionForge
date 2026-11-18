@@ -43,7 +43,7 @@ class AlignmentStage(ImageStage):
             return d["verification_status"]
         return f"match {d['score']:.2f}, {d['verification_status']}" + (f", {len(d['warnings'])} warning(s)" if d["warnings"] else "")
 
-    version = "1"
+    version = "2"
     title = "Caption verification and image-text alignment"
     processes = "46, 47, 48, 49, 50"
     depends = ("captioning", "embedding")
@@ -75,6 +75,10 @@ class AlignmentStage(ImageStage):
         self.terms, self.term_cat = _vocabulary()
         self.term_vecs = self.clip.encode_texts([f"a photo of {t}" for t in self.terms])
         self.patterns = {t: re.compile(rf"\b{re.escape(t)}\b", re.I) for t in self.terms}
+
+    def teardown(self, ctx):
+        self.clip = None  # with the hub's reference gone as well, the weights are freed
+        ctx.hub.unload(ctx.cfg.models.embedding)
 
     def process(self, ctx: StageContext, ref: ImgRef) -> dict:
         cap, cfg = ref.deps["captioning"], ctx.cfg.captioning
@@ -139,7 +143,10 @@ class AlignmentStage(ImageStage):
             warnings.append(f"low image-text alignment score ({score:.2f})")
 
         frac = len(unsupported) / len(claimed) if claimed else 0.0
-        failed = score < th["min_score"] or (unsupported and frac > th["fail_fraction"])
+        # Only the image-text similarity decides a failure. The word-level findings stay warnings: on real
+        # images with human-written captions they flagged correct captions (a table that is in the picture,
+        # a person holding the object) far more often than wrong ones.
+        failed = score < th["min_score"]
         status = "failed" if failed else ("warning" if (unsupported or missing or len(warnings) > len(truncated)) else "passed")
         confidence = float(np.clip(0.5 * score + 0.5 * (1 - frac) - 0.08 * len(missing), 0, 1))
         independent = cap.get("source") != "template_baseline"

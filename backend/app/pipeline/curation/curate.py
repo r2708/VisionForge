@@ -96,8 +96,11 @@ def run_curation(ctx: StageContext, final: bool = True) -> dict:
                         aes = qd["components"].get("aesthetic")
                         if q.min_aesthetic_score is not None and aes is not None and aes < q.min_aesthetic_score:
                             reject.append("low_aesthetic_score")
-                        if "watermark_likely" in flags or "watermark_text_detected" in flags:
-                            (quarantine if q.reject_watermarked else review).append("possible_watermark")
+                        if "watermark_text_detected" in flags:
+                            (quarantine if q.reject_watermarked else review).append("watermark_text_detected")
+                        if q.review_min_aesthetic_score is not None and aes is not None and aes < q.review_min_aesthetic_score:
+                            quarantine.append("very_low_aesthetic_score_pending_review")
+                            review.append("very_low_aesthetic_score")
                         od = data("ocr")
                         if q.max_text_area_fraction is not None and od and od["text_area_fraction"] > q.max_text_area_fraction:
                             quarantine.append("text_heavy")
@@ -129,8 +132,9 @@ def run_curation(ctx: StageContext, final: bool = True) -> dict:
                             ad = data("alignment")
                             if ad and ad.get("needs_review"):
                                 review.append(f"caption_verification_{ad['verification_status']}")
-                                if ad["verification_status"] == "failed" and cfg.captioning.strictness == "strict":
-                                    quarantine.append("caption_verification_failed")
+                            if ad and ad["verification_status"] == "failed" and (
+                                    cfg.captioning.quarantine_failed_verification or cfg.captioning.strictness == "strict"):
+                                quarantine.append("caption_verification_failed")
 
                 auto = "rejected" if reject else ("quarantined" if quarantine else "accepted")
                 reasons = reject + quarantine

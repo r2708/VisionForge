@@ -38,7 +38,10 @@ except Exception as exc:
     print(json.dumps({"ok": False, "error": "not logged in to Hugging Face: run `hf auth login` or set HF_TOKEN"}))
     sys.exit(0)
 if "/" not in a["repo_id"]:
-    a["repo_id"] = user + "/" + a["repo_id"]   # bare dataset name: use the logged-in account
+    bare = a["repo_id"]
+    a["repo_id"] = user + "/" + bare   # bare dataset name: use the logged-in account
+    if a.get("readme"):
+        a["readme"] = a["readme"].replace("<user>/" + bare, a["repo_id"])   # the card was written before the account was known
 try:
     api.create_repo(a["repo_id"], repo_type="dataset", private=a["private"], exist_ok=True)
     info = api.upload_folder(repo_id=a["repo_id"], repo_type="dataset", folder_path=a["folder"],
@@ -104,7 +107,7 @@ def maybe_upload(ws: Workspace, cfg=None, force: bool = False, say: Callable[[st
         return skip("there is no exported dataset yet")
     if hf.require_validation_passed and not export.get("validation_passed"):
         return skip("the last export did not pass validation")
-    if not force and size_mb < hf.min_size_mb:
+    if not force and size / 1024**2 < hf.min_size_mb:  # exact size: the rounded figure is only for messages
         return skip(f"output folder is {size_mb} MB, below the {hf.min_size_mb} MB threshold")
     if last and last.get("export_generated_at") == export.get("generated_at") and last.get("repo_id") == hf.repo_id:
         return skip("this export was already uploaded")

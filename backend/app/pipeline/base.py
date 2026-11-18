@@ -125,6 +125,10 @@ class ImageStage:
     def batch_size(self, ctx: StageContext) -> int:
         return 8
 
+    def chunk_size(self, ctx: StageContext) -> Optional[int]:
+        """Images per checkpoint; None uses ``processing.db_chunk_size``. Slow stages return a small number."""
+        return None
+
     # ------------------------------------------------------------------
     def _safe(self, ctx: StageContext, ref: ImgRef):
         try:
@@ -150,7 +154,7 @@ def run_image_stage(ctx: StageContext, stage: ImageStage, js: JobStage) -> None:
     cfg_fp = stage.fingerprint(cfg)
     model = stage.model_info(ctx)
     dep_names = tuple(stage.depends) + tuple(stage.soft_depends)
-    chunk = cfg.processing.db_chunk_size
+    chunk = stage.chunk_size(ctx) or cfg.processing.db_chunk_size
     max_attempts = 1 + cfg.processing.max_retries
 
     def base_filter(q):

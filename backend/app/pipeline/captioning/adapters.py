@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -269,3 +270,99 @@ class SmolVLMCaptionAdapter:
         out["generation_prompt"] = ", ".join([base] + extras) if base else ""
         out["prompt_styling_additions"] = []
         return out
+
+
+def _sentences(text: str) -> list[str]:
+    return [x.strip() for x in re.split(r"(?<=[.!?])\s+", " ".join(text.split())) if x.strip()]
+
+
+def summary_of(text: str, max_words: int = 75) -> str:
+    """The opening sentences of a long description, up to about ``max_words`` words; never cut mid-sentence."""
+    out, n = [], 0
+    for sentence in _sentences(text):
+        words = len(sentence.split())
+        if out and n + words > max_words:
+            break
+        out.append(sentence)
+        n += words
+    return " ".join(out)
+
+
+_HEADER_WORD = r"(?:detailed|descriptive|description|caption|image|screenshot|cleaned-up|cleaned|refined|final|for|the|of|and|a)"
+_LEAD_IN = re.compile(
+    r"^\s*(?:(?:sure|certainly|okay)[,!.]?\s*)?"
+    r"(?:here(?:'s|\u2019s| is| are)\b[^\n:]{0,120}:"                         # "Here is a cleaned-up and detailed caption for the image:"
+    rf"|(?:#+\s*|\*\*)?{_HEADER_WORD}(?:[ -]{_HEADER_WORD}){{0,6}}\s*:?\s*(?:\*\*)?\s*:?(?=\s))"   # "**Detailed Caption:**", "### Caption for the image"
+    r"\s*", re.I)
+
+
+def clean_supplied_caption(text: str) -> str:
+    """Remove what a language model wrapped around a caption: an announcing first line, markdown
+    emphasis, headings and rules. The description itself is left as written."""
+    text = (text or "").strip()
+    for _ in range(3):
+        text = re.sub(r"^\s*-{3,}\s*", "", text)
+        m = _LEAD_IN.match(text)
+        if not m or not m.group(0).strip() or ":" not in m.group(0) and "#" not in m.group(0) and "*" not in m.group(0):
+            break
+        text = text[m.end():]
+    text = re.sub(r"(?m)^\s*(?:-{3,}|#+)\s*", "", text)
+    text = text.replace("**", "").replace("__", "")
+    return " ".join(text.split())
+
+
+class AutoCaptionAdapter:
+    """The caption that came with the source when there is one; the local vision-language model
+    only for images without one. The model is loaded the first time it is actually needed, so a
+    batch where every image already has a caption never touches it."""
+
+    name = "auto"
+    source = "vlm"
+    VLM_PROMPT = SmolVLMCaptionAdapter.PROMPTS["detailed"]
+
+    def __init__(self, ctx: StageContext):
+        self.supplied = SidecarAdapter()
+        self.vlm = None
+        self.model_key = ctx.cfg.models.captioner
+        self.from_source = self.generated = 0
+        self.vlm_seconds = 0.0
+
+    def version(self) -> dict:
+        return {"prompt_version": PROMPT_VERSION, "template_version": "auto-2"}
+
+    def _model(self, ctx: StageContext):
+        if self.vlm is None:
+            ctx.progress("captioning", {"message": f"an image has no caption from the source: loading {self.model_key} "
+                                                   "(used only for such images)"})
+            started = time.time()
+            self.vlm = ctx.hub.get(self.model_key)
+            ctx.progress("captioning", {"message": f"{self.model_key} loaded in {time.time() - started:.1f}s"})
+        return self.vlm
+
+    def generate(self, ctx: StageContext, ref: ImgRef, facts: dict, cfg) -> dict:
+        text, digest = self.supplied.read(ref, cfg)
+        if text:
+            self.from_source += 1
+            text = clean_supplied_caption(text)
+            sentences = _sentences(text)
+            detailed = summary_of(text)
+            return {"short": sentences[0] if sentences else text, "detailed": detailed, "comprehensive": text,
+                    "generation_prompt": detailed, "alternatives": [], "sidecar_sha256": digest, "prompt_styling_additions": [],
+                    "source": cfg.supplied_source, "caption_model": None}
+        vlm = self._model(ctx)
+        started = time.time()
+        image = analysis_rgb(ref.abs_path, 768 if cfg.vlm_image_splitting else 512)
+        detailed = clean_caption(vlm.ask(image, self.VLM_PROMPT, min(cfg.max_new_tokens, 120), split_image=cfg.vlm_image_splitting))
+        self.generated += 1
+        self.vlm_seconds += time.time() - started
+        sentences = _sentences(detailed)
+        extras = [x for x in (LIGHTING.get(facts["lighting"]), STYLE_WORD.get(facts["style"])) if x and x.lower() not in detailed.lower()]
+        return {"short": sentences[0] if sentences else detailed, "detailed": detailed, "comprehensive": detailed,
+                "generation_prompt": ", ".join([detailed.rstrip(".")] + extras) if detailed else "", "alternatives": [],
+                "sidecar_sha256": None, "prompt_styling_additions": [], "source": "vlm", "caption_model": self.model_key}
+
+    def summary(self) -> str:
+        text = f"{self.from_source} caption(s) taken from the source, {self.generated} generated by {self.model_key}"
+        if self.generated:
+            text += f" ({self.vlm_seconds / self.generated:.1f}s per image)"
+        return text

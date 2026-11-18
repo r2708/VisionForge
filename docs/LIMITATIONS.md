@@ -24,8 +24,15 @@ Read this before using the output for training.
 - Tested end to end on 10 real Flickr URLs and on the first 80 images of `UWGZQ/pixmo_images` (upload
   off), and in automated tests with downloads and uploads faked. **No shard has been uploaded to the real Hub yet, and nothing near the full 9 million URLs
   has been run**: download speed, Flickr rate limits and how many listed photos are gone are unknown.
-- Duplicates are removed inside a shard and exact duplicates across shards (by listed checksum).
-  Near-duplicates across shards are not detected, and each shard has its own train/validation/test split.
+- Duplicates are removed inside a shard. Across shards, exact copies and perceptual duplicates (pHash
+  confirmed by dHash) of images already exported are removed through a hash ledger. A cropped or edited
+  version of an image in another shard is not detected: geometric verification needs the pixels of
+  both images, and earlier shards are no longer on disk. Embedding similarity was looked at as a
+  cross-shard signal and rejected: pairs above cosine 0.93 were different pictures of the same subject.
+  Each shard has its own train/validation/test split.
+- With `shards.caption_dataset` set, captions are joined from that dataset by `sha256(image_url)`. About
+  two thirds of the first source images of `UWGZQ/pixmo_images` have a caption in `allenai/pixmo-cap`
+  (measured on one quarter of the caption data); the rest are captioned by the local VLM.
 - Per-image author attribution is not available from the URL lists; records keep the source URL and the
   licence text you configure (`shards.license_note`), unverified.
 - Shard mode owns its workspace: after a shard is closed, the per-image working data for it is removed
@@ -40,8 +47,10 @@ Read this before using the output for training.
   loosely and scored the synthetic fixtures low across the board.
 - **Categories, style, lighting, scene, viewpoint and watermark likelihood are CLIP zero-shot guesses**
   over fixed label lists (`vision/labels.py`), stored as `inferred` with uncalibrated confidence.
-- Watermark/logo detection is a zero-shot probability plus OCR text patterns; there is no dedicated
-  logo detector. Textures and materials are not extracted.
+- Watermark detection reads text with OCR and matches watermark and credit-line patterns; there is no
+  logo detector, so a watermark without readable text is missed. The CLIP zero-shot watermark probability
+  is stored but not used: on a sample of real images it flagged 83% of them, most with ordinary text.
+  Textures and materials are not extracted.
 - Face counting uses an OpenCV Haar cascade, which misses faces and produces false positives.
 - Segmentation is GrabCut seeded by saliency (subject/background only), not a learned model.
 - Semantic groups are connected components above a cosine threshold, so chains of similar images can
